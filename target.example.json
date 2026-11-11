@@ -1,0 +1,19 @@
+{
+  "name": "local-test-app",
+  "login_url": "http://127.0.0.1:8000/login",
+  "protected_page_url": "http://127.0.0.1:8000/account",
+  "api_url": "http://127.0.0.1:8000/api/account",
+  "username_selector": "input[name=email]",
+  "password_selector": "input[name=password]",
+  "submit_selector": "button[type=submit]",
+  "logged_in_selector": "#account-nav",
+  "logout_selector": "#logout",
+  "logged_out_selector": "form#login",
+  "logout_request_url": "http://127.0.0.1:8000/logout",
+  "logout_request_method": "POST",
+  "credential_header": "Cookie",
+  "extra_headers": [],
+  "marker_field": "profile.display_name",
+  "rejection_statuses": [401],
+  "offsets_seconds": [0, 5, 30, 60]
+}
