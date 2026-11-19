@@ -1,0 +1,45 @@
+{
+  "stage": "replay",
+  "outcome": "accepted_after_logout",
+  "logout_confirmed": true,
+  "probes": [
+    {
+      "elapsed_seconds": 0.0,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 5.005,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 30.001,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 60.002,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 90.002,
+      "status": 200,
+      "outcome": "accepted"
+    }
+  ],
+  "target": "Lumina Study - Saved Notes",
+  "anonymous_control": {
+    "status": 200,
+    "outcome": "marker_absent"
+  },
+  "authenticated_control": {
+    "status": 200,
+    "outcome": "accepted"
+  },
+  "jwt_lifetime_seconds": 3600,
+  "jwt_remaining_at_logout_seconds": 3578.835,
+  "last_accepted_seconds": 90.002,
+  "first_rejected_after_last_accept_seconds": null
+}

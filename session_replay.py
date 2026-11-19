@@ -1,14 +1,25 @@
-"""Measure access with a test account's pre-logout credential."""
+"""LOCAL-ONLY session test with robust Lumina Study GET capture.
+
+Keep this file separate from the team's original session_replay.py.
+Only run against your own test account, with authorization for read-only testing.
+Never log request header values, access tokens, or personal data.
+"""
 import argparse
+import base64
 import json
 import os
 import sys
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, parse_qs
 
 import httpx
 from playwright.sync_api import Error as BrowserError
 from playwright.sync_api import sync_playwright
+
+
+def progress(message):
+    """Print progress immediately, without exposing tokens or request headers."""
+    print(f"[session-replay] {message}", file=sys.stderr, flush=True)
 
 
 class RunError(Exception):
@@ -19,10 +30,15 @@ def load_config(path):
     try:
         with open(path, encoding="utf-8") as file:
             config = json.load(file)
+        config.setdefault("marker_mode", "json_field")
+        if config["marker_mode"] not in ("json_field", "json_leaf"):
+            raise ValueError
         required = (
             "name", "login_url", "protected_page_url", "api_url",
-            "logout_selector", "logged_out_selector", "marker_field",
+            "logout_selector", "logged_out_selector",
         )
+        if config["marker_mode"] == "json_field":
+            required += ("marker_field",)
         if any(not isinstance(config[key], str) or not config[key] for key in required):
             raise ValueError
         optional = (
@@ -56,12 +72,66 @@ def load_config(path):
             for header in extra_headers
         ):
             raise ValueError
+        extra_markers = config.setdefault("required_leaf_values", [])
+        if (not isinstance(extra_markers, list)
+                or any(not isinstance(x, str) or not x for x in extra_markers)):
+            raise ValueError
+        config.setdefault("preserve_browser_metadata", False)
+        if type(config["preserve_browser_metadata"]) is not bool:
+            raise ValueError
         statuses = config.setdefault("rejection_statuses", [401])
         if not isinstance(statuses, list) or any(status not in (401, 403) for status in statuses):
             raise ValueError
         return config
     except (OSError, KeyError, TypeError, ValueError):
         raise RunError("Invalid target configuration.") from None
+
+
+# Preserve metadata actually sent by the authorized browser to TanStack Start
+# server functions. Do not manufacture Origin / Sec-Fetch-Site values or print
+# any header values. Auth comes only from the user's own signed-in test session.
+BROWSER_METADATA_HEADERS = frozenset({
+    "accept", "content-type", "origin", "referer", "user-agent",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+    "x-tsr-serverfn", "x-tss-context", "x-client-info",
+    "x-supabase-api-version", "apikey",
+})
+
+
+def has_exact_leaf(value, marker):
+    """Match a private marker as a complete JSON string value, not in an error."""
+    if isinstance(value, str):
+        return value == marker
+    if isinstance(value, dict):
+        return any(has_exact_leaf(v, marker) for v in value.values())
+    if isinstance(value, list):
+        return any(has_exact_leaf(v, marker) for v in value)
+    return False
+
+
+def jwt_metadata(headers):
+    """Decode public JWT timing claims locally; never print the JWT."""
+    authorization = headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    segments = token.split(".")
+    if len(segments) != 3:
+        return None
+    try:
+        payload_segment = segments[1]
+        payload = json.loads(base64.urlsafe_b64decode(
+            payload_segment + "=" * (-len(payload_segment) % 4)
+        ))
+        issued, expiration = payload["iat"], payload["exp"]
+        if not isinstance(issued, (int, float)) or not isinstance(expiration, (int, float)):
+            return None
+        if expiration <= issued:
+            return None
+        return {"jwt_lifetime_seconds": round(expiration - issued, 3),
+                "jwt_expires_at_unix": expiration}
+    except (ValueError, TypeError, KeyError):
+        return None
 
 
 def probe(config, headers, marker):
@@ -83,21 +153,31 @@ def probe(config, headers, marker):
     elif 200 <= status < 300:
         try:
             value = response.json()
-            for key in config["marker_field"].split("."):
-                value = value[key]
-            if value == marker:
-                outcome = "accepted"
+            if config.get("marker_mode") == "json_leaf":
+                # For the Performance record, require both the test-account
+                # topic marker and any additional exact string values requested.
+                needles = [marker, *config.get("required_leaf_values", [])]
+                outcome = ("accepted" if all(has_exact_leaf(value, item)
+                                             for item in needles)
+                           else "marker_absent")
+            else:
+                for key in config["marker_field"].split("."):
+                    value = value[key]
+                if value == marker:
+                    outcome = "accepted"
         except (KeyError, TypeError, ValueError):
             pass
     return {"status": status, "outcome": outcome}
 
 
 def login(page, config, manual):
+    progress("Opening sign-in page...")
     page.goto(config["login_url"])
     if manual:
         print("Complete login in the browser, then press Enter here.", file=sys.stderr)
         try:
             input()
+            progress("Enter received; proceeding with the test.")
         except EOFError:
             raise RunError("Manual login requires an interactive terminal.") from None
         return
@@ -115,23 +195,91 @@ def login(page, config, manual):
     page.locator(config["logged_in_selector"]).wait_for()
 
 
-def capture_headers(page, config):
-    with page.expect_request(
-        lambda request: request.method == "GET" and request.url == config["api_url"]
-    ) as captured:
+def target_request(request, config):
+    """Match a GET from the intended endpoint and own-account filter.
+
+    Query string ordering, percent encoding, and extra benign query parameters
+    do not affect the match. Keep same host, same path, same user_id filter.
+    """
+    if request.method != "GET":
+        return False
+    expected = urlsplit(config["api_url"])
+    actual = urlsplit(request.url)
+    if (actual.scheme, actual.netloc, actual.path) != (expected.scheme, expected.netloc, expected.path):
+        return False
+    wanted = parse_qs(expected.query)
+    present = parse_qs(actual.query)
+    for key in ("user_id",):
+        if key in wanted and wanted[key] != present.get(key):
+            return False
+    return True
+
+
+def capture_headers(page, config, seen_requests):
+    """Find a matching authenticated GET, including requests from manual login.
+
+    Browsers may fetch saved_notes during login before the old script started
+    listening. Event listeners are registered before login in this local runner.
+    """
+    def usable_request():
+        for req in reversed(seen_requests):
+            try:
+                request_headers = req.all_headers()
+                names = [config["credential_header"], *config["extra_headers"]]
+                if not all(request_headers.get(name.lower()) for name in names):
+                    continue
+                return req, request_headers
+            except BrowserError:
+                continue
+        return None
+
+    # Process queued request events after returning from interactive input().
+    page.wait_for_timeout(500)
+    found = usable_request()
+    if not found:
+        progress("No matching authenticated saved_notes GET captured during login.")
+        progress("Navigating to configured protected page and observing requests...")
         page.goto(config["protected_page_url"])
         if config.get("fetch_selector"):
             page.locator(config["fetch_selector"]).click()
+        page.wait_for_timeout(1500)
+        found = usable_request()
 
-    request_headers = captured.value.all_headers()
+    if not found:
+        print("In the Chromium test window, open the Notes page so saved_notes is fetched.",
+              "Then press Enter in THIS Terminal.", file=sys.stderr, flush=True)
+        try:
+            input()
+        except EOFError:
+            raise RunError("Interactive request capture requires a Terminal.") from None
+        page.wait_for_timeout(900)
+        found = usable_request()
+
+    if not found:
+        raise RunError(
+            "No authenticated saved_notes GET was observed. Check Notes page "
+            "and the configured account-specific user_id filter."
+        )
+
+    req, request_headers = found
+    # Use the exact request URL observed in this browser session for baselines
+    # and post-logout replay. Do not print this URL or auth material.
+    config["api_url"] = req.url
     names = [config["credential_header"], *config["extra_headers"]]
-    headers = {name: request_headers.get(name.lower()) for name in names}
-    if not all(headers.values()):
-        raise RunError("A configured header was missing from the protected request.")
+    if config.get("preserve_browser_metadata"):
+        headers = {name: value for name, value in request_headers.items()
+                   if name.lower() in BROWSER_METADATA_HEADERS and value}
+        credential = config["credential_header"].lower()
+        headers[credential] = request_headers[credential]
+    else:
+        headers = {name.lower(): request_headers[name.lower()] for name in names}
+    progress("Captured authenticated saved_notes GET from your test account "
+             "(request URL and credentials hidden).")
     return headers
 
 
 def logout(page, config):
+    progress("Locating Sign out button and initiating logout...")
     button = page.locator(config["logout_selector"])
     if "logout_request_url" in config:
         with page.expect_response(
@@ -140,15 +288,23 @@ def logout(page, config):
         ) as pending:
             button.click()
         response = pending.value
-        if not 200 <= response.status < 400 or response.finished() is not None:
-            raise RunError("The logout request did not complete successfully.")
+        progress(f"Logout HTTP response: {response.status}")
+        # The POST returned an HTTP status. Avoid response.finished(), which can
+        # wait indefinitely for certain responses even after status is observed.
+        if not 200 <= response.status < 400:
+            raise RunError("The logout request returned an unsuccessful status.")
+        progress("Logout response accepted; checking the signed-out page...")
     else:
         button.click()
-    page.locator(config["logged_out_selector"]).wait_for()
+        progress("Sign-out button clicked; checking the signed-out page...")
+    # Explicit bounded wait ensures the script never hangs here indefinitely.
+    page.locator(config["logged_out_selector"]).wait_for(state="visible", timeout=15000)
+    progress("Signed-out screen detected.")
 
 
 def run(config, args, report, marker):
     with sync_playwright() as playwright:
+        progress("Launching Playwright Chromium...")
         browser = playwright.chromium.launch(
             headless=not (args.headed or args.manual_login),
             executable_path=args.chromium_path,
@@ -157,35 +313,73 @@ def run(config, args, report, marker):
             context = browser.new_context(service_workers="block")
             page = context.new_page()
             page.set_default_timeout(15000)
+            # Observe requests starting BEFORE interactive login.
+            # Never print URLs, token values, or request headers.
+            seen_requests = []
+            page.on("request", lambda req: seen_requests.append(req)
+                    if target_request(req, config) else None)
             report["stage"] = "login"
+            progress("Stage: login")
             login(page, config, args.manual_login)
             report["stage"] = "capture"
-            headers = capture_headers(page, config)
+            progress("Stage: capture")
+            headers = capture_headers(page, config, seen_requests)
 
             report["stage"] = "baseline"
+            progress("Stage: baseline (checking authorization before logout)")
             # Keep non-session headers constant across the control and replay.
-            anonymous = {key: headers[key] for key in config["extra_headers"]}
+            if config.get("preserve_browser_metadata"):
+                # Remove the browser's authentication credential; preserve only
+                # the same harmless protocol metadata as the signed-in request.
+                anonymous = {key: value for key, value in headers.items()
+                             if key.lower() not in ("authorization", "cookie")}
+            else:
+                anonymous = {key.lower(): headers[key.lower()] for key in config["extra_headers"]}
             report["anonymous_control"] = probe(config, anonymous, marker)
             report["authenticated_control"] = probe(config, headers, marker)
+            progress(f"Anonymous control: {report['anonymous_control']['outcome']} (HTTP {report['anonymous_control']['status']})")
+            progress(f"Authenticated control: {report['authenticated_control']['outcome']} (HTTP {report['authenticated_control']['status']})")
             if (
-                report["anonymous_control"]["outcome"] != "rejected"
+                report["anonymous_control"]["outcome"] not in (
+                    "rejected", "marker_absent" if config["marker_mode"] == "json_leaf" else "rejected"
+                )
                 or report["authenticated_control"]["outcome"] != "accepted"
             ):
                 raise RunError("Baseline controls did not confirm a protected resource.")
 
+            metadata = jwt_metadata(headers)
+            if metadata:
+                report["jwt_lifetime_seconds"] = metadata["jwt_lifetime_seconds"]
+                progress(f"JWT lifetime: {metadata['jwt_lifetime_seconds']:.0f}s (decoded locally)")
             report["stage"] = "logout"
+            progress("Stage: logout")
             logout(page, config)
             start = time.monotonic()
             report["logout_confirmed"] = True
+            if metadata:
+                report["jwt_remaining_at_logout_seconds"] = round(
+                    metadata["jwt_expires_at_unix"] - time.time(), 3
+                )
+                progress("Estimated JWT validity remaining at logout confirmation: "
+                         + f"{report['jwt_remaining_at_logout_seconds']:.3f}s")
             report["stage"] = "replay"
+            progress("Stage: replay; testing the ORIGINAL credential after logout")
             for offset in config["offsets_seconds"]:
-                time.sleep(max(0, start + offset - time.monotonic()))
+                seconds_left = max(0, start + offset - time.monotonic())
+                if seconds_left > 0:
+                    progress(f"Next probe scheduled at +{offset}s; waiting {seconds_left:.1f}s...")
+                time.sleep(seconds_left)
                 elapsed = round(time.monotonic() - start, 3)
+                progress(f"Sending +{offset}s probe (elapsed {elapsed:.3f}s)...")
+                result = probe(config, headers, marker)
                 report["probes"].append({
                     "elapsed_seconds": elapsed,
-                    **probe(config, headers, marker),
+                    **result,
                 })
+                progress(f"+{offset}s probe: {result['outcome']} (HTTP {result['status']})")
+            progress("All replay probes completed.")
         finally:
+            progress("Closing Playwright Chromium...")
             browser.close()
 
 
@@ -202,6 +396,8 @@ def summarize(report):
     report["first_rejected_after_last_accept_seconds"] = first_rejected
     if last_accepted is not None:
         report["outcome"] = "accepted_after_logout"
+    elif any(result["outcome"] == "marker_absent" for result in report["probes"]):
+        report["outcome"] = "private_marker_not_returned_after_logout"
     elif any(result["outcome"] == "rejected" for result in report["probes"]):
         report["outcome"] = "rejected_after_logout"
 
@@ -212,7 +408,9 @@ def main():
     parser.add_argument("--headed", action="store_true")
     parser.add_argument("--manual-login", action="store_true")
     parser.add_argument("--chromium-path", help="Optional path to a system Chromium")
+    parser.add_argument("--output", help="Optional path to save the JSON results locally")
     args = parser.parse_args()
+    progress("Local Lumina capture-fix script started (team script unchanged).")
 
     report = {
         "stage": "setup",
@@ -222,6 +420,7 @@ def main():
     }
     try:
         config = load_config(args.config)
+        progress(f"Configuration valid for {config['name']}; offsets: {config['offsets_seconds']} seconds")
         report["target"] = config["name"]
         marker = os.environ.get("SESSION_REPLAY_MARKER")
         if not marker:
@@ -230,9 +429,20 @@ def main():
         summarize(report)
     except RunError as error:
         report["error"] = str(error)
-    except BrowserError:
+        progress(f"Failed during stage '{report['stage']}': {error}")
+    except BrowserError as error:
         report["error"] = "Browser operation failed or timed out."
-    print(json.dumps(report, indent=2))
+        progress(f"Browser error during stage '{report['stage']}': {type(error).__name__}: {str(error)[:300]}")
+    progress(f"Final result: {report['outcome']}; writing JSON report below.")
+    result_json = json.dumps(report, indent=2)
+    print(result_json, flush=True)
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as file:
+                file.write(result_json + "\n")
+            progress(f"Report saved to {args.output}")
+        except OSError as error:
+            progress(f"Could not save report ({type(error).__name__}); the report is printed above.")
     return 2 if report["outcome"] == "inconclusive" else 0
 
 
