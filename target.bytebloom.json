@@ -1,0 +1,31 @@
+{
+  "name": "Byte Bloom - Performance (local only)",
+  "login_url": "https://bytebloom.lovable.app/auth?mode=signin",
+  "protected_page_url": "https://bytebloom.lovable.app/performance",
+  "api_url": "https://bytebloom.lovable.app/_serverFn/ec0cc5bc4518cc492ced85b2dad423e47ecf4d124df083e17e6558fe2805d40c",
+  "logout_selector": "button[aria-label=\"Sign out\"]",
+  "logged_out_selector": "button:has-text('Continue with Google')",
+  "logout_request_url": "https://qhuhvqlmckjtvxlyjitr.supabase.co/auth/v1/logout?scope=global",
+  "logout_request_method": "POST",
+  "credential_header": "Authorization",
+  "extra_headers": [
+    "x-tsr-serverfn",
+    "accept"
+  ],
+  "rejection_statuses": [
+    401,
+    403
+  ],
+  "offsets_seconds": [
+    0,
+    5,
+    30,
+    60,
+    90
+  ],
+  "marker_mode": "json_leaf",
+  "required_leaf_values": [
+    "completed"
+  ],
+  "preserve_browser_metadata": true
+}

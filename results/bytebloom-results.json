@@ -1,0 +1,45 @@
+{
+  "stage": "replay",
+  "outcome": "accepted_after_logout",
+  "logout_confirmed": true,
+  "probes": [
+    {
+      "elapsed_seconds": 0.0,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 5.003,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 30.002,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 60.004,
+      "status": 200,
+      "outcome": "accepted"
+    },
+    {
+      "elapsed_seconds": 90.0,
+      "status": 200,
+      "outcome": "accepted"
+    }
+  ],
+  "target": "Byte Bloom - Performance (local only)",
+  "anonymous_control": {
+    "status": 200,
+    "outcome": "marker_absent"
+  },
+  "authenticated_control": {
+    "status": 200,
+    "outcome": "accepted"
+  },
+  "jwt_lifetime_seconds": 3600,
+  "jwt_remaining_at_logout_seconds": 3587.988,
+  "last_accepted_seconds": 90.0,
+  "first_rejected_after_last_accept_seconds": null
+}
